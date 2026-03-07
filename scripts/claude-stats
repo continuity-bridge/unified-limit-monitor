@@ -8,6 +8,8 @@ Usage:
     claude-stats week         # This week's usage
     claude-stats reset        # Time until next reset
     claude-stats json         # Output as JSON
+    claude-stats --watch      # Live updates (5s interval)
+    claude-stats --watch 2    # Live updates (2s interval)
 
 Author: Vector
 Created: 2026-03-07
@@ -16,6 +18,7 @@ Created: 2026-03-07
 import os
 import sys
 import json
+import time
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -125,12 +128,22 @@ def format_bar(percent, width=20):
     return '│' + '█' * filled + '░' * empty + '│'
 
 
-def print_status(status):
+def clear_screen():
+    """Clear terminal screen"""
+    os.system('clear' if os.name != 'nt' else 'cls')
+
+
+def print_status(status, show_timestamp=False):
     """Print formatted status"""
     if not status:
         print("No usage data available")
         print("Daemon may not be running or no activity detected yet")
         return
+    
+    if show_timestamp:
+        now = datetime.now().strftime('%I:%M:%S %p')
+        print(f"Updated: {now}")
+        print()
     
     print(f"Claude Usage Monitor")
     print(f"{'─' * 40}")
@@ -164,6 +177,10 @@ def print_status(status):
     elif status['percent'] >= 80:
         print()
         print("ℹ️  Usage elevated - monitor carefully")
+    
+    if show_timestamp:
+        print()
+        print("Press Ctrl+C to exit")
 
 
 def main():
@@ -171,6 +188,8 @@ def main():
     parser.add_argument('command', nargs='?', default='status',
                        choices=['status', 'today', 'week', 'reset', 'json'],
                        help='Command to execute')
+    parser.add_argument('--watch', '-w', nargs='?', const=5, type=int, metavar='INTERVAL',
+                       help='Live updates mode (default: 5 seconds)')
     
     args = parser.parse_args()
     
@@ -180,8 +199,24 @@ def main():
         print("ERROR: Cannot locate CLAUDE_HOME", file=sys.stderr)
         sys.exit(1)
     
-    # Load state
     state_file = claude_home / '.claude' / 'logs' / 'limit-tracker-state.json'
+    
+    # Watch mode - continuous updates
+    if args.watch:
+        interval = args.watch
+        try:
+            while True:
+                clear_screen()
+                state = load_state(state_file)
+                status = calculate_status(state)
+                print_status(status, show_timestamp=True)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            clear_screen()
+            print("\nWatch mode stopped")
+            sys.exit(0)
+    
+    # One-time commands
     state = load_state(state_file)
     status = calculate_status(state)
     
