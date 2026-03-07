@@ -13,10 +13,11 @@ Usage:
     claude-stats log chat     # Log 1 chat event manually
     claude-stats log code 2   # Log 2 code events manually
     claude-stats log cowork   # Log 1 cowork event manually
+    claude-stats clear        # Clear all events (for testing/manual reset)
 
 Author: Vector
 Created: 2026-03-07
-Updated: 2026-03-07 (added manual logging)
+Updated: 2026-03-07 (added manual logging + clear)
 """
 
 import os
@@ -110,6 +111,27 @@ def log_manual_event(state_file: Path, product: str, count: int = 1):
     
     total_weight = count * weight
     print(f"✓ Logged {count}x {product} event(s) ({total_weight:.1f} units)")
+    return True
+
+
+def clear_events(state_file: Path):
+    """Clear all tracked events"""
+    state = load_state(state_file)
+    if not state:
+        print("No state file found - nothing to clear")
+        return True
+    
+    event_count = len(state.get('events', []))
+    if event_count == 0:
+        print("No events to clear")
+        return True
+    
+    # Keep config, clear events
+    state['events'] = []
+    save_state(state_file, state)
+    
+    print(f"✓ Cleared {event_count} event(s)")
+    print("Usage reset to 0")
     return True
 
 
@@ -244,7 +266,7 @@ def print_status(status, show_timestamp=False):
 def main():
     parser = argparse.ArgumentParser(description='Query Claude usage statistics')
     parser.add_argument('command', nargs='?', default='status',
-                       help='Command to execute (status, reset, json, log)')
+                       help='Command to execute (status, reset, json, log, clear)')
     parser.add_argument('product', nargs='?',
                        help='Product type for log command (chat, code, cowork)')
     parser.add_argument('count', nargs='?', type=int, default=1,
@@ -261,6 +283,11 @@ def main():
         sys.exit(1)
     
     state_file = claude_home / '.claude' / 'logs' / 'limit-tracker-state.json'
+    
+    # Handle clear command
+    if args.command == 'clear':
+        success = clear_events(state_file)
+        sys.exit(0 if success else 1)
     
     # Handle log command
     if args.command == 'log':
