@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+claude-stats - Query Claude usage statistics
+
+Usage:
+    claude-stats              # Show current status
+    claude-stats today        # Today's usage
+    claude-stats week         # This week's usage
+    claude-stats reset        # Time until next reset
+    claude-stats json         # Output as JSON
+
+Author: Vector
+Created: 2026-03-07
+"""
+
+import os
+import sys
+import json
+import argparse
+from pathlib import Path
+from datetime import datetime, timedelta
+
+
+def detect_claude_home():
+    """Detect CLAUDE_HOME directory"""
+    if env_home := os.getenv('CLAUDE_HOME'):
+        return Path(env_home)
+    
+    if sys.platform == 'win32':
+        for drive in ['D:', 'C:']:
+            candidate = Path(f"{drive}/Claude")
+            if candidate.exists():
+                return candidate
+    
+    unix_home = Path.home() / "Claude"
+    if unix_home.exists():
+        return unix_home
+    
+    laptop_home = Path.home() / "continuity-bridge_tallest-anchor"
+    if laptop_home.exists():
+        return laptop_home
+    
+    return None
+
+
+def load_state(state_file: Path):
+    """Load tracker state"""
+    if not state_file.exists():
+        return None
+    
+    with open(state_file) as f:
+        return json.load(f)
+
+
+def calculate_status(state):
+    """Calculate current status from state"""
+    if not state or 'events' not in state:
+        return None
+    
+    # Plan limits
+    limits = {
+        'pro': 45,
+        'max_5x': 225,
+        'max_20x': 900
+    }
+    
+    plan = state.get('plan', 'pro')
+    window_hours = state.get('window_hours', 5)
+    limit = limits.get(plan, 45)
+    
+    # Filter events in current window
+    cutoff = datetime.now() - timedelta(hours=window_hours)
+    events = []
+    
+    for event in state['events']:
+        event_time = datetime.fromisoformat(event['timestamp'])
+        if event_time >= cutoff:
+            events.append(event)
+    
+    # Calculate usage
+    total_weight = sum(e['weight'] for e in events)
+    
+    # Breakdown by product
+    by_product = {}
+    for product in ['chat', 'code', 'cowork']:
+        product_events = [e for e in events if e['product'] == product]
+        by_product[product] = {
+            'count': len(product_events),
+            'weight': sum(e['weight'] for e in product_events)
+        }
+    
+    # Next reset
+    if events:
+        oldest = min(datetime.fromisoformat(e['timestamp']) for e in events)
+        next_reset = oldest + timedelta(hours=window_hours)
+        time_to_reset = next_reset - datetime.now()
+    else:
+        next_reset = None
+        time_to_reset = timedelta(0)
+    
+    remaining = max(0, limit - total_weight)
+    percent = (total_weight / limit) * 100 if limit > 0 else 0
+    
+    return {
+        'plan': plan,
+        'window_hours': window_hours,
+        'limit': limit,
+        'used': total_weight,
+        'remaining': remaining,
+        'percent': percent,
+        'by_product': by_product,
+        'next_reset': next_reset.isoformat() if next_reset else None,
+        'time_to_reset': {
+            'hours': int(time_to_reset.total_seconds() // 3600),
+            'minutes': int((time_to_reset.total_seconds() % 3600) // 60)
+        },
+        'event_count': len(events)
+    }
+
+
+def format_bar(percent, width=20):
+    """Create progress bar"""
+    filled = int(width * percent / 100)
+    empty = width - filled
+    return '│' + '█' * filled + '░' * empty + '│'
+
+
+def print_status(status):
+    """Print formatted status"""
+    if not status:
+        print("No usage data available")
+        print("Daemon may not be running or no activity detected yet")
+        return
+    
+    print(f"Claude Usage Monitor")
+    print(f"{'─' * 40}")
+    print()
+    print(f"Plan: {status['plan'].upper()}")
+    print(f"Rolling Window ({status['window_hours']}hr): {status['used']:.1f}/{status['limit']} ({status['percent']:.0f}%)")
+    print(format_bar(status['percent']))
+    print()
+    
+    print("Breakdown:")
+    for product in ['chat', 'code', 'cowork']:
+        data = status['by_product'][product]
+        if data['count'] > 0:
+            print(f"  {product.capitalize():8} {data['count']:3} events  ({data['weight']:.1f} units)")
+    
+    print(f"{'─' * 40}")
+    print(f"Total:              {status['event_count']:3} events  ({status['used']:.1f} units)")
+    print()
+    
+    if status['next_reset']:
+        reset = status['time_to_reset']
+        print(f"Next reset: {reset['hours']}h {reset['minutes']}m")
+    
+    # Warnings
+    if status['percent'] >= 95:
+        print()
+        print("⚠️  CRITICAL: Near usage limit!")
+    elif status['percent'] >= 90:
+        print()
+        print("⚠️  WARNING: Usage high - consider waiting for reset")
+    elif status['percent'] >= 80:
+        print()
+        print("ℹ️  Usage elevated - monitor carefully")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Query Claude usage statistics')
+    parser.add_argument('command', nargs='?', default='status',
+                       choices=['status', 'today', 'week', 'reset', 'json'],
+                       help='Command to execute')
+    
+    args = parser.parse_args()
+    
+    # Detect CLAUDE_HOME
+    claude_home = detect_claude_home()
+    if not claude_home:
+        print("ERROR: Cannot locate CLAUDE_HOME", file=sys.stderr)
+        sys.exit(1)
+    
+    # Load state
+    state_file = claude_home / '.claude' / 'logs' / 'limit-tracker-state.json'
+    state = load_state(state_file)
+    status = calculate_status(state)
+    
+    if args.command == 'json':
+        print(json.dumps(status, indent=2))
+    elif args.command == 'reset':
+        if status and status['next_reset']:
+            reset = status['time_to_reset']
+            print(f"Next reset in: {reset['hours']}h {reset['minutes']}m")
+        else:
+            print("No reset time available")
+    else:
+        print_status(status)
+
+
+if __name__ == '__main__':
+    main()

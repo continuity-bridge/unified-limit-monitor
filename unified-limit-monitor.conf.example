@@ -1,0 +1,36 @@
+# Claude Unified Limit Monitor Configuration
+# Place in: {CLAUDE_HOME}/.claude/unified-limit-monitor.conf
+
+[account]
+# Your Claude plan: pro, max_5x, max_20x
+plan = pro
+
+[limits]
+# Rolling window (hours)
+rolling_window_hours = 5
+
+# Limit per window (auto-set based on plan)
+# pro: 45, max_5x: 225, max_20x: 900
+rolling_window_limit = 45
+
+[weights]
+# Consumption weights (relative to chat)
+# Adjust based on your actual usage patterns
+chat = 1.0
+code = 5.0
+cowork = 10.0
+
+[notifications]
+# Notification thresholds (percentage of limit)
+threshold_warning = 80
+threshold_urgent = 90
+threshold_critical = 95
+
+[tracking]
+# Which products to detect
+detect_chat = true
+detect_code = true
+detect_cowork = true
+
+# Update interval (seconds)
+update_interval = 60
