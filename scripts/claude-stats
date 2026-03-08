@@ -2,25 +2,25 @@
 """
 claude-stats - Query Claude usage statistics
 
+Reads the state file written by claude-limit-daemon.py.
+
 Usage:
-    claude-stats              # Show current status
-    claude-stats today        # Today's usage
-    claude-stats week         # This week's usage
+    claude-stats              # Show current status (default)
+    claude-stats json         # Raw JSON output
     claude-stats reset        # Time until next reset
-    claude-stats json         # Output as JSON
-    claude-stats --watch      # Live updates (5s interval)
-    claude-stats --watch 2    # Live updates (2s interval)
-    claude-stats log chat     # Log 1 chat event manually
-    claude-stats log code 2   # Log 2 code events manually
-    claude-stats log cowork   # Log 1 cowork event manually
-    claude-stats clear        # Clear all events (for testing/manual reset)
-    claude-stats mode         # Show current mode
-    claude-stats mode cowork  # Set mode to cowork (daemon applies 10x weight)
-    claude-stats mode chat    # Set mode to chat (daemon applies 1x weight)
+    claude-stats --watch      # Live updates every 5s
+    claude-stats --watch 2    # Live updates every 2s
+
+Legacy manual-logging commands (v1 compat — less useful with real API):
+    claude-stats log chat     # Manually log 1 chat event
+    claude-stats log code 2   # Manually log 2 code events
+    claude-stats log cowork   # Manually log 1 cowork event
+    claude-stats clear        # Clear all manually logged events
+    claude-stats mode         # Show/set current mode
 
 Author: Vector
 Created: 2026-03-07
-Updated: 2026-03-07 (added manual logging, clear, mode toggle)
+Updated: 2026-03-08 (Rich output, real API state format)
 """
 
 import os
@@ -29,358 +29,405 @@ import json
 import time
 import argparse
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict
+
+# ── Optional Rich ─────────────────────────────────────────────────────────────
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.progress import BarColumn, Progress, TextColumn
+    from rich.text import Text
+    from rich.panel import Panel
+    from rich import box
+    RICH = True
+    console = Console()
+except ImportError:
+    RICH = False
+    console = None
 
 
-def detect_claude_home():
-    """Detect CLAUDE_HOME directory"""
+# ── Path detection ─────────────────────────────────────────────────────────────
+
+def detect_claude_home() -> Optional[Path]:
     if env_home := os.getenv('CLAUDE_HOME'):
         return Path(env_home)
-    
     if sys.platform == 'win32':
         for drive in ['D:', 'C:']:
             candidate = Path(f"{drive}/Claude")
             if candidate.exists():
                 return candidate
-    
-    unix_home = Path.home() / "Claude"
+    unix_home = Path.home() / 'Claude'
     if unix_home.exists():
         return unix_home
-    
-    laptop_home = Path.home() / "continuity-bridge_tallest-anchor"
+    laptop_home = Path.home() / 'continuity-bridge_tallest-anchor'
     if laptop_home.exists():
         return laptop_home
-    
     return None
 
 
-def load_state(state_file: Path):
-    """Load tracker state"""
+# ── State I/O ─────────────────────────────────────────────────────────────────
+
+def load_state(state_file: Path) -> Optional[Dict]:
     if not state_file.exists():
         return None
-    
-    with open(state_file) as f:
-        return json.load(f)
-
-
-def save_state(state_file: Path, state):
-    """Save tracker state"""
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Atomic write
-    temp_file = state_file.with_suffix('.tmp')
-    with open(temp_file, 'w') as f:
-        json.dump(state, f, indent=2)
-    temp_file.replace(state_file)
-
-
-def log_manual_event(state_file: Path, product: str, count: int = 1):
-    """Manually log usage event"""
-    # Weight mapping
-    weights = {
-        'chat': 1.0,
-        'code': 5.0,
-        'cowork': 10.0
-    }
-    
-    if product not in weights:
-        print(f"ERROR: Invalid product '{product}'. Use: chat, code, or cowork", file=sys.stderr)
-        return False
-    
-    # Load or create state
-    state = load_state(state_file)
-    if not state:
-        state = {
-            'plan': 'pro',
-            'window_hours': 5,
-            'events': []
-        }
-    
-    # Add events
-    now = datetime.now()
-    weight = weights[product]
-    
-    for _ in range(count):
-        event = {
-            'timestamp': now.isoformat(),
-            'product': product,
-            'weight': weight,
-            'source': 'manual'
-        }
-        state['events'].append(event)
-    
-    # Save state
-    save_state(state_file, state)
-    
-    total_weight = count * weight
-    print(f"✓ Logged {count}x {product} event(s) ({total_weight:.1f} units)")
-    return True
-
-
-def clear_events(state_file: Path):
-    """Clear all tracked events"""
-    state = load_state(state_file)
-    if not state:
-        print("No state file found - nothing to clear")
-        return True
-    
-    event_count = len(state.get('events', []))
-    if event_count == 0:
-        print("No events to clear")
-        return True
-    
-    # Keep config, clear events
-    state['events'] = []
-    save_state(state_file, state)
-    
-    print(f"✓ Cleared {event_count} event(s)")
-    print("Usage reset to 0")
-    return True
-
-
-def set_mode(state_file: Path, mode: str = None):
-    """Set or get current detection mode"""
-    valid_modes = ['chat', 'code', 'cowork']
-    
-    # Load or create state
-    state = load_state(state_file)
-    if not state:
-        state = {
-            'plan': 'pro',
-            'window_hours': 5,
-            'events': [],
-            'mode': 'chat'
-        }
-    
-    # Get current mode
-    current_mode = state.get('mode', 'chat')
-    
-    # If no mode specified, show current
-    if mode is None:
-        print(f"Current mode: {current_mode}")
-        print()
-        print("Available modes:")
-        print("  chat   - Regular chat (1x weight)")
-        print("  code   - Claude Code (5x weight)")
-        print("  cowork - Cowork file tasks (10x weight)")
-        print()
-        print("Usage: claude-stats mode <chat|code|cowork>")
-        return True
-    
-    # Validate and set new mode
-    if mode not in valid_modes:
-        print(f"ERROR: Invalid mode '{mode}'", file=sys.stderr)
-        print(f"Valid modes: {', '.join(valid_modes)}", file=sys.stderr)
-        return False
-    
-    # Update mode
-    state['mode'] = mode
-    save_state(state_file, state)
-    
-    # Show confirmation with weight info
-    weights = {'chat': '1x', 'code': '5x', 'cowork': '10x'}
-    print(f"✓ Mode set to: {mode} ({weights[mode]} weight)")
-    print()
-    print("Daemon will now apply this weight to detected activity.")
-    return True
-
-
-def calculate_status(state):
-    """Calculate current status from state"""
-    if not state or 'events' not in state:
+    try:
+        with open(state_file) as f:
+            return json.load(f)
+    except Exception:
         return None
-    
-    # Plan limits
-    limits = {
-        'pro': 45,
-        'max_5x': 225,
-        'max_20x': 900
-    }
-    
-    plan = state.get('plan', 'pro')
-    window_hours = state.get('window_hours', 5)
-    limit = limits.get(plan, 45)
-    
-    # Filter events in current window
-    cutoff = datetime.now() - timedelta(hours=window_hours)
-    events = []
-    
-    for event in state['events']:
-        event_time = datetime.fromisoformat(event['timestamp'])
-        if event_time >= cutoff:
-            events.append(event)
-    
-    # Calculate usage
-    total_weight = sum(e['weight'] for e in events)
-    
-    # Breakdown by product
-    by_product = {}
-    for product in ['chat', 'code', 'cowork']:
-        product_events = [e for e in events if e['product'] == product]
-        by_product[product] = {
-            'count': len(product_events),
-            'weight': sum(e['weight'] for e in product_events)
+
+
+def save_state(state_file: Path, state: Dict):
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = state_file.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(state, f, indent=2)
+    tmp.replace(state_file)
+
+
+# ── Status computation ─────────────────────────────────────────────────────────
+
+def compute_status(state: Dict) -> Optional[Dict]:
+    """Normalise state into a display-ready dict regardless of source (api/legacy)."""
+    if not state:
+        return None
+
+    source = state.get('source', 'legacy')
+
+    # ── Real API state format ─────────────────────────────────────────────────
+    if 'session' in state:
+        s = state['session']
+        w = state.get('weekly', {})
+
+        td_secs = s.get('time_to_reset_seconds', 0)
+        td      = timedelta(seconds=max(0, td_secs))
+
+        return {
+            'source':       source,
+            'last_updated': state.get('last_updated', ''),
+            'percent':      float(s.get('percent', 0)),
+            'used':         float(s.get('used',    0)),
+            'limit':        float(s.get('limit',   0)),
+            'reset_at':     s.get('reset_at'),
+            'time_to_reset': {
+                'hours':   int(td.total_seconds() // 3600),
+                'minutes': int((td.total_seconds() % 3600) // 60),
+            },
+            'weekly': {
+                'percent': float(w.get('percent', 0)),
+                'used':    float(w.get('used',    0)),
+                'limit':   float(w.get('limit',   0)),
+            },
+            'is_real_api': True,
         }
-    
-    # Next reset
+
+    # ── Legacy rolling-window state ───────────────────────────────────────────
+    plan   = state.get('plan', 'pro')
+    limits = {'pro': 45, 'max_5x': 225, 'max_20x': 900}
+    limit  = limits.get(plan, 45)
+    window = int(state.get('window_hours', 5))
+
+    cutoff = datetime.now() - timedelta(hours=window)
+    events = [
+        e for e in state.get('events', [])
+        if datetime.fromisoformat(e['timestamp']) >= cutoff
+    ]
+
+    used    = sum(e['weight'] for e in events)
+    percent = (used / limit * 100) if limit else 0
+
     if events:
-        oldest = min(datetime.fromisoformat(e['timestamp']) for e in events)
-        next_reset = oldest + timedelta(hours=window_hours)
-        time_to_reset = next_reset - datetime.now()
+        oldest    = min(datetime.fromisoformat(e['timestamp']) for e in events)
+        next_r    = oldest + timedelta(hours=window)
+        td        = max(timedelta(0), next_r - datetime.now())
+        reset_iso = next_r.isoformat()
     else:
-        next_reset = None
-        time_to_reset = timedelta(0)
-    
-    remaining = max(0, limit - total_weight)
-    percent = (total_weight / limit) * 100 if limit > 0 else 0
-    
+        td        = timedelta(0)
+        reset_iso = None
+
+    by_product = {}
+    for prod in ['chat', 'code', 'cowork']:
+        pe = [e for e in events if e['product'] == prod]
+        by_product[prod] = {'count': len(pe), 'weight': sum(e['weight'] for e in pe)}
+
     return {
-        'plan': plan,
-        'window_hours': window_hours,
-        'limit': limit,
-        'used': total_weight,
-        'remaining': remaining,
-        'percent': percent,
-        'by_product': by_product,
-        'next_reset': next_reset.isoformat() if next_reset else None,
+        'source':       'legacy',
+        'last_updated': '',
+        'plan':         plan,
+        'percent':      percent,
+        'used':         used,
+        'limit':        limit,
+        'reset_at':     reset_iso,
         'time_to_reset': {
-            'hours': int(time_to_reset.total_seconds() // 3600),
-            'minutes': int((time_to_reset.total_seconds() % 3600) // 60)
+            'hours':   int(td.total_seconds() // 3600),
+            'minutes': int((td.total_seconds() % 3600) // 60),
         },
-        'event_count': len(events)
+        'weekly':      {'percent': 0, 'used': 0, 'limit': 0},
+        'by_product':  by_product,
+        'event_count': len(events),
+        'is_real_api': False,
     }
 
 
-def format_bar(percent, width=20):
-    """Create progress bar"""
-    filled = int(width * percent / 100)
-    empty = width - filled
-    return '│' + '█' * filled + '░' * empty + '│'
+# ── Display ────────────────────────────────────────────────────────────────────
+
+def _pct_color(pct: float) -> str:
+    if pct >= 95: return 'red'
+    if pct >= 80: return 'orange1'
+    if pct >= 60: return 'yellow'
+    return 'green'
+
+
+def _bar(pct: float, width: int = 24) -> str:
+    filled = int(width * min(pct, 100) / 100)
+    return '█' * filled + '░' * (width - filled)
+
+
+def print_status_rich(status: Dict, show_ts: bool = False):
+    if not status:
+        console.print('[dim]No data — is claude-limit-daemon running?[/dim]')
+        return
+
+    pct    = status['percent']
+    color  = _pct_color(pct)
+    bar    = _bar(pct)
+    reset  = status['time_to_reset']
+    reset_str = f"{reset['hours']}h {reset['minutes']}m"
+
+    if show_ts:
+        console.print(f"[dim]Updated {datetime.now().strftime('%I:%M:%S %p')}[/dim]")
+
+    # Header
+    source_tag = '[dim](real API)[/dim]' if status.get('is_real_api') else '[dim](estimated)[/dim]'
+    console.print(f'\n[bold]Claude Usage Monitor[/bold] {source_tag}')
+    console.print('─' * 44)
+
+    # 5h window
+    console.print(f'\n  [bold]5h Window[/bold]')
+    console.print(f'  [{color}]{bar}[/{color}]  [{color}]{pct:.0f}%[/{color}]')
+
+    used  = status['used']
+    limit = status['limit']
+    if limit:
+        console.print(f'  {used:.0f} / {limit:.0f}  ·  resets in [bold]{reset_str}[/bold]')
+    else:
+        console.print(f'  resets in [bold]{reset_str}[/bold]')
+
+    # Weekly (real API only)
+    w = status.get('weekly', {})
+    if w.get('percent', 0) > 0:
+        wpct  = w['percent']
+        wbar  = _bar(wpct, width=24)
+        wcol  = _pct_color(wpct)
+        console.print(f'\n  [bold]Weekly[/bold]')
+        console.print(f'  [{wcol}]{wbar}[/{wcol}]  [{wcol}]{wpct:.0f}%[/{wcol}]')
+        if w.get('limit', 0):
+            console.print(f'  {w["used"]:.0f} / {w["limit"]:.0f}')
+
+    # Legacy breakdown
+    bp = status.get('by_product', {})
+    if any(v.get('count', 0) > 0 for v in bp.values()):
+        console.print('\n  [bold]Breakdown[/bold] (estimated)')
+        for prod in ['chat', 'code', 'cowork']:
+            d = bp.get(prod, {})
+            if d.get('count', 0):
+                console.print(f'  {prod.capitalize():8}  {d["count"]:3} events  ({d["weight"]:.1f} units)')
+
+    # Warnings
+    if pct >= 95:
+        console.print(f'\n  [bold red]⚠  CRITICAL — near limit![/bold red]')
+    elif pct >= 90:
+        console.print(f'\n  [yellow]⚠  HIGH — consider waiting for reset[/yellow]')
+    elif pct >= 80:
+        console.print(f'\n  [yellow]ℹ  Elevated — monitor carefully[/yellow]')
+
+    console.print()
+    if show_ts:
+        console.print('[dim]  Ctrl-C to exit[/dim]')
+
+
+def print_status_plain(status: Optional[Dict], show_ts: bool = False):
+    if not status:
+        print('No usage data available')
+        print('Daemon may not be running or no data yet')
+        return
+
+    pct   = status['percent']
+    bar   = _bar(pct)
+    reset = status['time_to_reset']
+
+    if show_ts:
+        print(f"Updated: {datetime.now().strftime('%I:%M:%S %p')}\n")
+
+    source = '(real API)' if status.get('is_real_api') else '(estimated)'
+    print(f'Claude Usage Monitor {source}')
+    print('─' * 40)
+    print(f'\n5h Window: {pct:.0f}%')
+    print(f'  {bar}')
+    if status['limit']:
+        print(f'  {status["used"]:.0f} / {status["limit"]:.0f}')
+    print(f'  Resets in {reset["hours"]}h {reset["minutes"]}m')
+
+    w = status.get('weekly', {})
+    if w.get('percent', 0) > 0:
+        print(f'\nWeekly: {w["percent"]:.0f}%  ({w["used"]:.0f}/{w["limit"]:.0f})')
+
+    bp = status.get('by_product', {})
+    if any(v.get('count', 0) for v in bp.values()):
+        print('\nBreakdown (estimated):')
+        for prod in ['chat', 'code', 'cowork']:
+            d = bp.get(prod, {})
+            if d.get('count', 0):
+                print(f'  {prod.capitalize():8}  {d["count"]:3} events  ({d["weight"]:.1f} units)')
+
+    if pct >= 95:
+        print('\n⚠  CRITICAL: Near usage limit!')
+    elif pct >= 90:
+        print('\n⚠  WARNING: Consider waiting for reset')
+    elif pct >= 80:
+        print('\nℹ  Usage elevated')
+
+    print()
+    if show_ts:
+        print('Press Ctrl-C to exit')
+
+
+def print_status(status, show_ts: bool = False):
+    if RICH:
+        print_status_rich(status, show_ts)
+    else:
+        print_status_plain(status, show_ts)
 
 
 def clear_screen():
-    """Clear terminal screen"""
     os.system('clear' if os.name != 'nt' else 'cls')
 
 
-def print_status(status, show_timestamp=False):
-    """Print formatted status"""
-    if not status:
-        print("No usage data available")
-        print("Daemon may not be running or no activity detected yet")
-        return
-    
-    if show_timestamp:
-        now = datetime.now().strftime('%I:%M:%S %p')
-        print(f"Updated: {now}")
-        print()
-    
-    print(f"Claude Usage Monitor")
-    print(f"{'─' * 40}")
-    print()
-    print(f"Plan: {status['plan'].upper()}")
-    print(f"Rolling Window ({status['window_hours']}hr): {status['used']:.1f}/{status['limit']} ({status['percent']:.0f}%)")
-    print(format_bar(status['percent']))
-    print()
-    
-    print("Breakdown:")
-    for product in ['chat', 'code', 'cowork']:
-        data = status['by_product'][product]
-        if data['count'] > 0:
-            print(f"  {product.capitalize():8} {data['count']:3} events  ({data['weight']:.1f} units)")
-    
-    print(f"{'─' * 40}")
-    print(f"Total:              {status['event_count']:3} events  ({status['used']:.1f} units)")
-    print()
-    
-    if status['next_reset']:
-        reset = status['time_to_reset']
-        print(f"Next reset: {reset['hours']}h {reset['minutes']}m")
-    
-    # Warnings
-    if status['percent'] >= 95:
-        print()
-        print("⚠️  CRITICAL: Near usage limit!")
-    elif status['percent'] >= 90:
-        print()
-        print("⚠️  WARNING: Usage high - consider waiting for reset")
-    elif status['percent'] >= 80:
-        print()
-        print("ℹ️  Usage elevated - monitor carefully")
-    
-    if show_timestamp:
-        print()
-        print("Press Ctrl+C to exit")
+# ── Legacy manual logging (v1 compat) ─────────────────────────────────────────
 
+def log_manual_event(state_file: Path, product: str, count: int = 1) -> bool:
+    weights = {'chat': 1.0, 'code': 5.0, 'cowork': 10.0}
+    if product not in weights:
+        print(f"ERROR: Invalid product '{product}'. Use: chat, code, cowork", file=sys.stderr)
+        return False
+
+    state = load_state(state_file) or {'plan': 'pro', 'window_hours': 5, 'events': []}
+    if 'events' not in state:
+        state['events'] = []
+
+    now    = datetime.now()
+    weight = weights[product]
+    for _ in range(count):
+        state['events'].append({
+            'timestamp': now.isoformat(),
+            'product':   product,
+            'weight':    weight,
+            'source':    'manual',
+        })
+
+    save_state(state_file, state)
+    print(f'✓ Logged {count}x {product} ({count * weight:.1f} units)')
+    return True
+
+
+def clear_events(state_file: Path) -> bool:
+    state = load_state(state_file)
+    if not state:
+        print('No state file — nothing to clear')
+        return True
+    n = len(state.get('events', []))
+    state['events'] = []
+    save_state(state_file, state)
+    print(f'✓ Cleared {n} event(s)')
+    return True
+
+
+def set_mode(state_file: Path, mode: Optional[str] = None) -> bool:
+    valid = ['chat', 'code', 'cowork']
+    state = load_state(state_file) or {'plan': 'pro', 'window_hours': 5, 'events': []}
+    current = state.get('mode', 'chat')
+
+    if mode is None:
+        print(f'Current mode: {current}')
+        print('\nAvailable: ' + ', '.join(valid))
+        return True
+
+    if mode not in valid:
+        print(f"ERROR: Invalid mode '{mode}'", file=sys.stderr)
+        return False
+
+    state['mode'] = mode
+    save_state(state_file, state)
+    weights = {'chat': '1x', 'code': '5x', 'cowork': '10x'}
+    print(f'✓ Mode set to: {mode} ({weights[mode]} weight)')
+    return True
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description='Query Claude usage statistics')
     parser.add_argument('command', nargs='?', default='status',
-                       help='Command to execute (status, reset, json, log, clear, mode)')
+                        help='status (default), json, reset, log, clear, mode')
     parser.add_argument('product', nargs='?',
-                       help='Product type for log command (chat, code, cowork) OR mode name for mode command')
-    parser.add_argument('count', nargs='?', type=int, default=1,
-                       help='Number of events to log (default: 1)')
+                        help='Product for log/mode command')
+    parser.add_argument('count',   nargs='?', type=int, default=1,
+                        help='Event count for log command (default 1)')
     parser.add_argument('--watch', '-w', nargs='?', const=5, type=int, metavar='INTERVAL',
-                       help='Live updates mode (default: 5 seconds)')
-    
+                        help='Live updates (default interval 5s)')
     args = parser.parse_args()
-    
-    # Detect CLAUDE_HOME
+
     claude_home = detect_claude_home()
     if not claude_home:
-        print("ERROR: Cannot locate CLAUDE_HOME", file=sys.stderr)
+        print('ERROR: Cannot locate CLAUDE_HOME', file=sys.stderr)
         sys.exit(1)
-    
+
     state_file = claude_home / '.claude' / 'logs' / 'limit-tracker-state.json'
-    
-    # Handle mode command
+
+    # ── Commands that don't need status ──────────────────────────────────────
     if args.command == 'mode':
-        success = set_mode(state_file, args.product)  # product arg becomes mode name
-        sys.exit(0 if success else 1)
-    
-    # Handle clear command
+        sys.exit(0 if set_mode(state_file, args.product) else 1)
+
     if args.command == 'clear':
-        success = clear_events(state_file)
-        sys.exit(0 if success else 1)
-    
-    # Handle log command
+        sys.exit(0 if clear_events(state_file) else 1)
+
     if args.command == 'log':
         if not args.product:
-            print("ERROR: Product required for log command", file=sys.stderr)
-            print("Usage: claude-stats log <chat|code|cowork> [count]", file=sys.stderr)
+            print('Usage: claude-stats log <chat|code|cowork> [count]', file=sys.stderr)
             sys.exit(1)
-        
-        success = log_manual_event(state_file, args.product, args.count)
-        sys.exit(0 if success else 1)
-    
-    # Watch mode - continuous updates
+        sys.exit(0 if log_manual_event(state_file, args.product, args.count) else 1)
+
+    # ── Watch mode ────────────────────────────────────────────────────────────
     if args.watch:
         interval = args.watch
         try:
             while True:
                 clear_screen()
-                state = load_state(state_file)
-                status = calculate_status(state)
-                print_status(status, show_timestamp=True)
+                state  = load_state(state_file)
+                status = compute_status(state)
+                print_status(status, show_ts=True)
                 time.sleep(interval)
         except KeyboardInterrupt:
             clear_screen()
-            print("\nWatch mode stopped")
+            print('\nWatch mode stopped')
             sys.exit(0)
-    
-    # One-time commands
-    state = load_state(state_file)
-    status = calculate_status(state)
-    
+
+    # ── One-shot commands ─────────────────────────────────────────────────────
+    state  = load_state(state_file)
+    status = compute_status(state)
+
     if args.command == 'json':
-        print(json.dumps(status, indent=2))
+        print(json.dumps(status, indent=2, default=str))
     elif args.command == 'reset':
-        if status and status['next_reset']:
-            reset = status['time_to_reset']
-            print(f"Next reset in: {reset['hours']}h {reset['minutes']}m")
+        if status:
+            r = status['time_to_reset']
+            print(f'Resets in: {r["hours"]}h {r["minutes"]}m')
+            if status.get('reset_at'):
+                print(f'Reset at:  {status["reset_at"]}')
         else:
-            print("No reset time available")
+            print('No reset time available')
     else:
         print_status(status)
 

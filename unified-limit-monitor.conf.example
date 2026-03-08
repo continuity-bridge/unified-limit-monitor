@@ -1,36 +1,57 @@
-# Claude Unified Limit Monitor Configuration
-# Place in: {CLAUDE_HOME}/.claude/unified-limit-monitor.conf
+# Claude Unified Limit Monitor — Configuration
+# Copy to: {CLAUDE_HOME}/.claude/unified-limit-monitor.conf
+#
+# v2 changes: real API polling replaces process heuristics.
+# Most of the [weights] / [tracking] sections are now informational only.
 
 [account]
 # Your Claude plan: pro, max_5x, max_20x
+# Used for legacy/fallback display only — real limits come from the API.
 plan = pro
 
-[limits]
-# Rolling window (hours)
-rolling_window_hours = 5
+[api]
+# How often to poll the Anthropic usage endpoint (seconds).
+# The endpoint rate-limits aggressive polling; 300s (5 min) is recommended.
+poll_interval = 300
 
-# Limit per window (auto-set based on plan)
-# pro: 45, max_5x: 225, max_20x: 900
+# HTTP timeout for API requests (seconds)
+timeout = 15
+
+# Return stale data on 429 rather than showing an error
+retry_on_429 = true
+
+[notifications]
+# Notification thresholds (% of 5h window limit)
+threshold_warning  = 80
+threshold_urgent   = 90
+threshold_critical = 95
+
+# Minimum seconds between repeated notifications at the same level
+cooldown_seconds = 300
+
+[tray]
+# Show system tray icon (requires pystray + Pillow)
+# pip install pystray Pillow --break-system-packages
+enabled = true
+
+# Show % in the tray icon image
+show_percent_in_label = true
+
+# ── Legacy / informational (v1 compat) ─────────────────────────────────────────
+# These values are used only when API data is unavailable.
+
+[limits]
+rolling_window_hours = 5
 rolling_window_limit = 45
 
 [weights]
-# Consumption weights (relative to chat)
-# Adjust based on your actual usage patterns
-chat = 1.0
-code = 5.0
+# Relative consumption per product (1 chat message = 1 unit)
+chat   = 1.0
+code   = 5.0
 cowork = 10.0
 
-[notifications]
-# Notification thresholds (percentage of limit)
-threshold_warning = 80
-threshold_urgent = 90
-threshold_critical = 95
-
 [tracking]
-# Which products to detect
-detect_chat = true
-detect_code = true
+detect_chat   = true
+detect_code   = true
 detect_cowork = true
-
-# Update interval (seconds)
 update_interval = 60
