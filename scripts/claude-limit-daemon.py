@@ -124,7 +124,8 @@ class LimitTracker:
 class ProcessMonitor:
     """Monitors Claude processes"""
     
-    def __init__(self):
+    def __init__(self, state_file: Path):
+        self.state_file = state_file
         self.last_seen = {
             'chat': None,    # Claude Desktop (chat mode)
             'code': None,    # Claude Code CLI
@@ -143,12 +144,10 @@ class ProcessMonitor:
         # Check for Claude Code (terminal)
         code_active = self._check_process(['claude-code', 'claude'], cmdline_contains='claude')
         
-        # Heuristic: If Desktop active, check for Cowork indicators
-        # (This is approximate - refine based on actual process details)
+        # Determine product based on what's running
         if desktop_active:
-            # For now, assume chat mode
-            # TODO: Detect Cowork vs Chat mode more accurately
-            product = 'chat'
+            # Read mode from state file
+            product = self._get_current_mode()
         elif code_active:
             product = 'code'
         else:
@@ -164,6 +163,18 @@ class ProcessMonitor:
             return product
         
         return None
+    
+    def _get_current_mode(self) -> str:
+        """Read current mode from state file"""
+        if not self.state_file.exists():
+            return 'chat'  # Default
+        
+        try:
+            with open(self.state_file) as f:
+                state = json.load(f)
+            return state.get('mode', 'chat')
+        except Exception:
+            return 'chat'  # Default on error
     
     def _check_process(self, names: List[str], cmdline_contains: Optional[str] = None) -> bool:
         """Check if process with given name(s) is running"""
@@ -306,10 +317,21 @@ def load_config(config_path: Path) -> configparser.ConfigParser:
 
 def save_state(state_file: Path, tracker: LimitTracker):
     """Save tracker state to file"""
+    # Load existing state to preserve mode
+    existing_mode = 'chat'  # default
+    if state_file.exists():
+        try:
+            with open(state_file) as f:
+                existing = json.load(f)
+            existing_mode = existing.get('mode', 'chat')
+        except Exception:
+            pass
+    
     state = {
         'plan': tracker.plan,
         'window_hours': tracker.window_hours,
-        'events': [asdict(e) for e in tracker.events]
+        'events': [asdict(e) for e in tracker.events],
+        'mode': existing_mode  # Preserve mode
     }
     
     state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -362,7 +384,7 @@ def main():
     
     # Initialize components
     tracker = load_state(state_file, config)
-    monitor = ProcessMonitor()
+    monitor = ProcessMonitor(state_file)
     notifier = NotificationManager(config)
     
     update_interval = config.getint('tracking', 'update_interval', fallback=60)
